@@ -6,9 +6,16 @@ import os
 from langchain.tools import tool
 from langchain.chat_models import init_chat_model
 from langgraph.prebuilt import create_react_agent
+from pydantic import BaseModel, Field
 
 
-@tool
+class transferCallInput(BaseModel):
+    destination: str = Field(
+        description="The destination phone number. The default is +1234567890."
+    )
+
+
+@tool("transferCall", args_schema=transferCallInput)
 def transferCall(destination: str = "+1234567890") -> str:
     """Transfer the call to a human agent."""
     return f"Transferring call to {destination}"
@@ -25,12 +32,11 @@ When user want to talk to human , call `transferCall` tool.
 def create_voice_agent(system_prompt: str = DEF_SYS_PROMPT):
     """Create and configure the React Agent with tools"""
     llm = init_chat_model(
-        model=os.getenv("MODEL_NAME", "gpt-4.1"),
-        model_provider="openai"
+        model=os.getenv("MODEL_NAME", "gpt-4.1"), model_provider="openai"
     )
 
     tools = [transferCall]
-    agent = create_react_agent(llm, tools, prompt=system_prompt)
+    agent = create_react_agent(llm, tools, prompt=system_prompt, interrupt_before=["tools"])
     return agent
 
 

@@ -127,7 +127,7 @@ def verify_token(authorization: str = Header(None)):
     return token
 
 
-@app.post("/chat/completions")
+@app.post("/v1/chat/completions")
 async def chat_completions(
     request: ChatCompletionRequest, _: str = Depends(verify_token)
 ):
@@ -402,4 +402,4 @@ def run_server():
     """Run the FastAPI server"""
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="localhost", port=8000)
