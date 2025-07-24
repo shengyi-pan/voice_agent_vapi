@@ -1,0 +1,405 @@
+"""
+FastAPI server implementation for Voice Agent VAPI
+"""
+
+import os
+import json
+import time
+from typing import Dict, Any, List, Optional
+from dotenv import load_dotenv, find_dotenv
+from fastapi import FastAPI, HTTPException, Depends, Header
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+from langchain_core.messages import HumanMessage, AIMessage, AIMessageChunk
+
+from ..agent.agent import create_voice_agent
+
+
+# Load environment variables
+load_dotenv(find_dotenv())
+
+
+# Pydantic models for request/response
+class ToolCall(BaseModel):
+    id: str
+    type: str
+    function: Dict[str, Any]
+
+
+class ChatMessage(BaseModel):
+    role: str
+    content: Optional[str] = None
+    name: Optional[str] = None  # Used for function/tool responses
+    tool_calls: Optional[List[ToolCall]] = None
+    tool_call_id: Optional[str] = None  # Used for tool responses
+
+
+class Function(BaseModel):
+    name: str
+    description: Optional[str] = None
+    parameters: Optional[Dict[str, Any]] = None
+
+
+class Tool(BaseModel):
+    type: str = "function"
+    function: Function
+
+
+class ResponseFormat(BaseModel):
+    type: str = "text"  # "text", "json_object", "json_schema"
+    json_schema: Optional[Dict[str, Any]] = None
+
+
+class ChatCompletionRequest(BaseModel):
+    # Required parameters
+    model: str
+    messages: List[ChatMessage]
+
+    # Optional parameters (matching OpenAI API)
+    frequency_penalty: Optional[float] = 0.0
+    logit_bias: Optional[Dict[str, float]] = None
+    logprobs: Optional[bool] = False
+    top_logprobs: Optional[int] = None
+    max_tokens: Optional[int] = None
+    max_completion_tokens: Optional[int] = None
+    n: Optional[int] = 1
+    presence_penalty: Optional[float] = 0.0
+    response_format: Optional[ResponseFormat] = None
+    seed: Optional[int] = None
+    service_tier: Optional[str] = None
+    stop: Optional[List[str]] = None
+    stream: Optional[bool] = False
+    stream_options: Optional[Dict[str, Any]] = None
+    temperature: Optional[float] = 1.0
+    top_p: Optional[float] = 1.0
+    tools: Optional[List[Tool]] = None
+    tool_choice: Optional[str] = None  # "none", "auto", "required", or specific tool
+    parallel_tool_calls: Optional[bool] = True
+    user: Optional[str] = None
+
+    # Additional fields for compatibility
+    function_call: Optional[str] = None  # Deprecated but still supported
+    functions: Optional[List[Function]] = None  # Deprecated but still supported
+
+
+class Usage(BaseModel):
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+
+
+class ChatCompletionChoice(BaseModel):
+    index: int
+    message: Optional[ChatMessage] = None
+    delta: Optional[Dict[str, Any]] = None
+    logprobs: Optional[Dict[str, Any]] = None
+    finish_reason: Optional[str] = None
+
+
+class ChatCompletionResponse(BaseModel):
+    id: str
+    object: str
+    created: int
+    model: str
+    system_fingerprint: Optional[str] = None
+    choices: List[ChatCompletionChoice]
+    usage: Optional[Usage] = None
+
+
+# Initialize FastAPI app
+app = FastAPI(title="Voice Agent VAPI", version="1.0.0")
+
+# Global agent instance
+agent = create_voice_agent()
+
+
+# Authentication
+def verify_token(authorization: str = Header(None)):
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Authorization header required")
+
+    token = authorization.replace("Bearer ", "")
+    expected_token = os.getenv("API_TOKEN", "your_api_token_here")
+
+    if token != expected_token:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    return token
+
+
+@app.post("/chat/completions")
+async def chat_completions(
+    request: ChatCompletionRequest, _: str = Depends(verify_token)
+):
+    """OpenAI-compatible chat completions endpoint"""
+
+    # Convert messages to LangGraph format
+    messages = []
+    for msg in request.messages:
+        if msg.role == "user":
+            messages.append(HumanMessage(content=msg.content or ""))
+        elif msg.role == "assistant":
+            messages.append(AIMessage(content=msg.content or ""))
+
+    # Create thread config
+    thread_config = {"configurable": {"thread_id": "default"}}
+
+    if request.stream:
+        # Streaming response
+        async def stream_response():
+            try:
+                # Generate unique response ID
+                response_id = f"chatcmpl-{int(time.time())}"
+                created_time = int(time.time())
+
+                # First, send the initial chunk with role
+                initial_chunk = {
+                    "id": response_id,
+                    "object": "chat.completion.chunk",
+                    "created": created_time,
+                    "model": request.model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"role": "assistant"},
+                            "finish_reason": None,
+                        }
+                    ],
+                }
+                yield f"data: {json.dumps(initial_chunk)}\n\n"
+
+                # Stream the LLM responses
+                accumulated_chunk = None
+                has_tool_calls = False
+                tool_calls_sent = False
+
+                for event in agent.stream(
+                    {"messages": messages}, config=thread_config, stream_mode="messages"
+                ):
+                    chunk = event[0]
+                    if isinstance(chunk, AIMessageChunk):
+                        # Check if this chunk has tool call chunks
+                        if chunk.tool_call_chunks:
+                            has_tool_calls = True
+                            # Accumulate chunks when tool calls are present
+                            if accumulated_chunk is None:
+                                accumulated_chunk = chunk
+                            else:
+                                accumulated_chunk += chunk
+                        else:
+                            if has_tool_calls and not tool_calls_sent:
+                                # Still accumulating for tool calls
+                                if accumulated_chunk is None:
+                                    accumulated_chunk = chunk
+                                else:
+                                    accumulated_chunk += chunk
+                            else:
+                                # Normal streaming for non-tool responses
+                                if chunk.content:
+                                    chunk_data = {
+                                        "id": response_id,
+                                        "object": "chat.completion.chunk",
+                                        "created": created_time,
+                                        "model": request.model,
+                                        "choices": [
+                                            {
+                                                "index": 0,
+                                                "delta": {"content": chunk.content},
+                                                "finish_reason": None,
+                                            }
+                                        ],
+                                    }
+                                    yield f"data: {json.dumps(chunk_data)}\n\n"
+
+                # Handle accumulated tool calls
+                if has_tool_calls and accumulated_chunk and not tool_calls_sent:
+                    # First, send accumulated content if any (content comes before tool calls)
+                    if accumulated_chunk.content:
+                        chunk_data = {
+                            "id": response_id,
+                            "object": "chat.completion.chunk",
+                            "created": created_time,
+                            "model": request.model,
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {"content": accumulated_chunk.content},
+                                    "finish_reason": None,
+                                }
+                            ],
+                        }
+                        yield f"data: {json.dumps(chunk_data)}\n\n"
+
+                    # Then, send tool calls if any
+                    if accumulated_chunk.tool_call_chunks:
+                        # Send tool calls in OpenAI SSE format
+                        tool_calls_data = []
+                        for i, tool_chunk in enumerate(
+                            accumulated_chunk.tool_call_chunks
+                        ):
+                            tool_call = {
+                                "index": i,
+                                "id": tool_chunk.get(
+                                    "id", f"call_{int(time.time())}_{i}"
+                                ),
+                                "type": "function",
+                                "function": {
+                                    "name": tool_chunk.get("name", ""),
+                                    "arguments": json.dumps(tool_chunk.get("args", {})),
+                                },
+                            }
+                            tool_calls_data.append(tool_call)
+
+                        # Send tool calls chunk
+                        tool_chunk_data = {
+                            "id": response_id,
+                            "object": "chat.completion.chunk",
+                            "created": created_time,
+                            "model": request.model,
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {"tool_calls": tool_calls_data},
+                                    "finish_reason": None,
+                                }
+                            ],
+                        }
+                        yield f"data: {json.dumps(tool_chunk_data)}\n\n"
+
+                        # Send finish chunk for tool calls
+                        finish_tool_chunk = {
+                            "id": response_id,
+                            "object": "chat.completion.chunk",
+                            "created": created_time,
+                            "model": request.model,
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {},
+                                    "finish_reason": "tool_calls",
+                                }
+                            ],
+                        }
+                        yield f"data: {json.dumps(finish_tool_chunk)}\n\n"
+                        tool_calls_sent = True
+
+                # Send final chunk only if not already sent for tool calls
+                if not (has_tool_calls and tool_calls_sent):
+                    final_chunk = {
+                        "id": response_id,
+                        "object": "chat.completion.chunk",
+                        "created": created_time,
+                        "model": request.model,
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                    }
+                    yield f"data: {json.dumps(final_chunk)}\n\n"
+
+                yield "data: [DONE]\n\n"
+
+            except Exception as e:
+                error_chunk = {"error": {"message": str(e), "type": "internal_error"}}
+                yield f"data: {json.dumps(error_chunk)}\n\n"
+
+        return StreamingResponse(
+            stream_response(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Headers": "*",
+                "Access-Control-Allow-Methods": "*",
+            },
+        )
+
+    else:
+        # Non-streaming response
+        try:
+            result = agent.invoke({"messages": messages}, config=thread_config)
+
+            # Extract the final message
+            final_message = result["messages"][-1]
+
+            # Generate response ID and timestamp
+            response_id = f"chatcmpl-{int(time.time())}"
+            created_time = int(time.time())
+
+            # Determine finish reason and prepare message
+            finish_reason = "stop"
+            message_content = final_message.content
+            tool_calls = None
+
+            # Check if the message has tool calls
+            if hasattr(final_message, "tool_calls") and final_message.tool_calls:
+                finish_reason = "tool_calls"
+
+                # Convert tool calls to OpenAI format
+                tool_calls = []
+                for tool_call in final_message.tool_calls:
+                    openai_tool_call = ToolCall(
+                        id=tool_call.get(
+                            "id", f"call_{int(time.time())}_{len(tool_calls)}"
+                        ),
+                        type="function",
+                        function={
+                            "name": tool_call.get("name", ""),
+                            "arguments": json.dumps(tool_call.get("args", {})),
+                        },
+                    )
+                    tool_calls.append(openai_tool_call)
+
+            # Create the message object
+            message = ChatMessage(
+                role="assistant", content=message_content, tool_calls=tool_calls
+            )
+
+            # Calculate token usage (simplified estimation)
+            # In a real implementation, you'd want to use tiktoken or similar
+            prompt_text = " ".join([msg.content or "" for msg in request.messages])
+            completion_text = message_content or ""
+
+            # Rough token estimation (1 token ≈ 4 characters)
+            prompt_tokens = max(1, len(prompt_text) // 4)
+            completion_tokens = max(1, len(completion_text) // 4)
+            total_tokens = prompt_tokens + completion_tokens
+
+            usage = Usage(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=total_tokens,
+            )
+
+            response = ChatCompletionResponse(
+                id=response_id,
+                object="chat.completion",
+                created=created_time,
+                model=request.model,
+                system_fingerprint=f"fp_{hash(request.model) % 1000000:06d}",
+                choices=[
+                    ChatCompletionChoice(
+                        index=0,
+                        message=message,
+                        logprobs=None,
+                        finish_reason=finish_reason,
+                    )
+                ],
+                usage=usage,
+            )
+
+            return response
+
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return {"status": "healthy", "timestamp": int(time.time())}
+
+
+def run_server():
+    """Run the FastAPI server"""
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=8000)

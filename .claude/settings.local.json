@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(uv sync:*)",
+      "Bash(touch:*)",
+      "Bash(python:*)",
+      "Bash(mkdir:*)",
+      "Bash(mv:*)",
+      "Bash(rm:*)",
+      "WebFetch(domain:platform.openai.com)",
+      "WebFetch(domain:docs.openai.com)",
+      "WebFetch(domain:cookbook.openai.com)",
+      "WebFetch(domain:github.com)"
+    ],
+    "deny": []
+  }
+}

@@ -1,0 +1,20 @@
+[project]
+name = "voice-agent-vapi"
+version = "0.1.0"
+description = "Voice Agent VAPI custom LLM server"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi==0.115.8",
+    "uvicorn==0.34.0",
+    "python-dotenv==1.0.1",
+    "httpx==0.28.1",
+    "ipython==8.13.2",
+    "black>=25.1.0",
+    "ipykernel~=6.0",
+    "langchain~=0.3",
+    "langgraph~=0.5",
+    "langchain-openai~=0.3",
+    "pydantic~=2.0",
+    "sse-starlette~=2.0"
+]
