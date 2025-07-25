@@ -145,73 +145,61 @@ async def chat_completions(
     thread_config = {"configurable": {"thread_id": "default"}}
 
     if request.stream:
-        # Streaming response
-        async def stream_response():
-            try:
-                # Generate unique response ID
-                response_id = f"chatcmpl-{int(time.time())}"
-                created_time = int(time.time())
+        return handle_streaming_req(messages, thread_config, request)
 
-                # First, send the initial chunk with role
-                initial_chunk = {
-                    "id": response_id,
-                    "object": "chat.completion.chunk",
-                    "created": created_time,
-                    "model": request.model,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {"role": "assistant"},
-                            "finish_reason": None,
-                        }
-                    ],
-                }
-                yield f"data: {json.dumps(initial_chunk)}\n\n"
+    else:
+        return handle_non_streaming_req(messages, thread_config, request)
 
-                # Stream the LLM responses
-                accumulated_chunk = None
-                has_tool_calls = False
-                tool_calls_sent = False
-                ai_content_sent = False
 
-                for event in agent.stream(
-                    {"messages": messages}, config=thread_config, stream_mode="messages"
-                ):
-                    chunk = event[0]
-                    # 如果 Agent 自动调用工具， AIMessage会交替出现 tool调用 和 内容生成
-                    if isinstance(chunk, AIMessageChunk):
-                        # 如果 content 有数据，就先返回
-                        if chunk.content:
-                            chunk_data = {
-                                "id": response_id,
-                                "object": "chat.completion.chunk",
-                                "created": created_time,
-                                "model": request.model,
-                                "choices": [
-                                    {
-                                        "index": 0,
-                                        "delta": {"content": chunk.content},
-                                        "finish_reason": None,
-                                    }
-                                ],
-                            }
-                            yield f"data: {json.dumps(chunk_data)}\n\n"
-                            ai_content_sent = True
+def handle_streaming_req(
+    messages: List, thread_config: Dict[str, Any], request: ChatCompletionRequest
+):
+    """
+    处理流式请求
 
-                        # 如果有工具调用就触发chunk累积，可能会累积到最后的AIMessage
-                        if chunk.tool_call_chunks or has_tool_calls:
-                            has_tool_calls = True
-                            # Accumulate chunks when tool calls are present
-                            if accumulated_chunk is None:
-                                accumulated_chunk = chunk
-                            else:
-                                accumulated_chunk += chunk
+    Args:
+        messages: 消息列表
+        thread_config: langchain state配置
+        request: 请求对象
+    """
 
-                is_contain_transfer = False
-                # Handle accumulated tool calls
-                if has_tool_calls and accumulated_chunk and not tool_calls_sent:
-                    # 如果累积的 AIMessage 有内容，且没有发送过 AI 内容，就先发送
-                    if accumulated_chunk.content and not ai_content_sent:
+    # Streaming response
+    async def stream_response():
+        try:
+            # Generate unique response ID
+            response_id = f"chatcmpl-{int(time.time())}"
+            created_time = int(time.time())
+
+            # First, send the initial chunk with role
+            initial_chunk = {
+                "id": response_id,
+                "object": "chat.completion.chunk",
+                "created": created_time,
+                "model": request.model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"role": "assistant"},
+                        "finish_reason": None,
+                    }
+                ],
+            }
+            yield f"data: {json.dumps(initial_chunk)}\n\n"
+
+            # Stream the LLM responses
+            accumulated_chunk = None
+            has_tool_calls = False
+            tool_calls_sent = False
+            ai_content_sent = False
+
+            for event in agent.stream(
+                {"messages": messages}, config=thread_config, stream_mode="messages"
+            ):
+                chunk = event[0]
+                # 如果 Agent 自动调用工具， AIMessage会交替出现 tool调用 和 内容生成
+                if isinstance(chunk, AIMessageChunk):
+                    # 如果 content 有数据，就先返回
+                    if chunk.content:
                         chunk_data = {
                             "id": response_id,
                             "object": "chat.completion.chunk",
@@ -220,173 +208,210 @@ async def chat_completions(
                             "choices": [
                                 {
                                     "index": 0,
-                                    "delta": {"content": accumulated_chunk.content},
+                                    "delta": {"content": chunk.content},
                                     "finish_reason": None,
                                 }
                             ],
                         }
                         yield f"data: {json.dumps(chunk_data)}\n\n"
+                        ai_content_sent = True
 
-                    # Then, send tool calls if any
-                    if accumulated_chunk.tool_call_chunks:
-                        # Send tool calls in OpenAI SSE format
-                        tool_calls_data = []
-                        for i, tool_chunk in enumerate(
-                            accumulated_chunk.tool_call_chunks
-                        ):
-                            tool_call = {
-                                "index": i,
-                                "id": tool_chunk.get(
-                                    "id", f"call_{int(time.time())}_{i}"
-                                ),
-                                "type": "function",
-                                "function": {
-                                    "name": tool_chunk.get("name", ""),
-                                    "arguments": json.dumps(tool_chunk.get("args", {})),
-                                },
+                    # 如果有工具调用就触发chunk累积，可能会累积到最后的AIMessage
+                    if chunk.tool_call_chunks or has_tool_calls:
+                        has_tool_calls = True
+                        # Accumulate chunks when tool calls are present
+                        if accumulated_chunk is None:
+                            accumulated_chunk = chunk
+                        else:
+                            accumulated_chunk += chunk
+
+            is_contain_transfer = False
+            # Handle accumulated tool calls
+            if has_tool_calls and accumulated_chunk and not tool_calls_sent:
+                # 如果累积的 AIMessage 有内容，且没有发送过 AI 内容，就先发送
+                if accumulated_chunk.content and not ai_content_sent:
+                    chunk_data = {
+                        "id": response_id,
+                        "object": "chat.completion.chunk",
+                        "created": created_time,
+                        "model": request.model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"content": accumulated_chunk.content},
+                                "finish_reason": None,
                             }
+                        ],
+                    }
+                    yield f"data: {json.dumps(chunk_data)}\n\n"
 
-                            if is_transfer_tool(tool_chunk.get("name", "")):
-                                is_contain_transfer = True
-
-                            tool_calls_data.append(tool_call)
-
-                        # Send tool calls chunk
-                        tool_chunk_data = {
-                            "id": response_id,
-                            "object": "chat.completion.chunk",
-                            "created": created_time,
-                            "model": request.model,
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "delta": {"tool_calls": tool_calls_data},
-                                    "finish_reason": None,
-                                }
-                            ],
+                # Then, send tool calls if any
+                if accumulated_chunk.tool_call_chunks:
+                    # Send tool calls in OpenAI SSE format
+                    tool_calls_data = []
+                    for i, tool_chunk in enumerate(accumulated_chunk.tool_call_chunks):
+                        tool_call = {
+                            "index": i,
+                            "id": tool_chunk.get("id", f"call_{int(time.time())}_{i}"),
+                            "type": "function",
+                            "function": {
+                                "name": tool_chunk.get("name", ""),
+                                "arguments": json.dumps(tool_chunk.get("args", {})),
+                            },
                         }
-                        yield f"data: {json.dumps(tool_chunk_data)}\n\n"
-                        tool_calls_sent = True
 
-                # Send finish chunk with proper finish reason
-                # 如果工具调用包含转人工，finish_reason 为 tool_calls，否则为 stop
-                if is_contain_transfer:
-                    finish_reason = "tool_calls"
-                else:
-                    finish_reason = "stop"
+                        if is_transfer_tool(tool_chunk.get("name", "")):
+                            is_contain_transfer = True
 
-                # Send finish chunk
-                finish_tool_chunk = {
-                    "id": response_id,
-                    "object": "chat.completion.chunk",
-                    "created": created_time,
-                    "model": request.model,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {},
-                            "finish_reason": finish_reason,
-                        }
-                    ],
-                }
-                yield f"data: {json.dumps(finish_tool_chunk)}\n\n"
+                        tool_calls_data.append(tool_call)
 
-                yield "data: [DONE]\n\n"
+                    # Send tool calls chunk
+                    tool_chunk_data = {
+                        "id": response_id,
+                        "object": "chat.completion.chunk",
+                        "created": created_time,
+                        "model": request.model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"tool_calls": tool_calls_data},
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                    yield f"data: {json.dumps(tool_chunk_data)}\n\n"
+                    tool_calls_sent = True
 
-            except Exception as e:
-                error_chunk = {"error": {"message": str(e), "type": "internal_error"}}
-                yield f"data: {json.dumps(error_chunk)}\n\n"
-
-        return StreamingResponse(
-            stream_response(),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "Access-Control-Allow-Origin": "*",
-                "Access-Control-Allow-Headers": "*",
-                "Access-Control-Allow-Methods": "*",
-            },
-        )
-
-    else:
-        # Non-streaming response
-        try:
-            result = agent.invoke({"messages": messages}, config=thread_config)
-
-            # Extract the final message
-            final_message = result["messages"][-1]
-
-            # Generate response ID and timestamp
-            response_id = f"chatcmpl-{int(time.time())}"
-            created_time = int(time.time())
-
-            # Determine finish reason and prepare message
-            finish_reason = "stop"
-            message_content = final_message.content
-            tool_calls = None
-
-            # Check if the message has tool calls
-            if hasattr(final_message, "tool_calls") and final_message.tool_calls:
+            # Send finish chunk with proper finish reason
+            # 如果工具调用包含转人工，finish_reason 为 tool_calls，否则为 stop
+            if is_contain_transfer:
                 finish_reason = "tool_calls"
+            else:
+                finish_reason = "stop"
 
-                # Convert tool calls to OpenAI format
-                tool_calls = []
-                for tool_call in final_message.tool_calls:
-                    openai_tool_call = ToolCall(
-                        id=tool_call.get(
-                            "id", f"call_{int(time.time())}_{len(tool_calls)}"
-                        ),
-                        type="function",
-                        function={
-                            "name": tool_call.get("name", ""),
-                            "arguments": json.dumps(tool_call.get("args", {})),
-                        },
-                    )
-                    tool_calls.append(openai_tool_call)
-
-            # Create the message object
-            message = ChatMessage(
-                role="assistant", content=message_content, tool_calls=tool_calls
-            )
-
-            # Calculate token usage (simplified estimation)
-            # In a real implementation, you'd want to use tiktoken or similar
-            prompt_text = " ".join([msg.content or "" for msg in request.messages])
-            completion_text = message_content or ""
-
-            # Rough token estimation (1 token ≈ 4 characters)
-            prompt_tokens = max(1, len(prompt_text) // 4)
-            completion_tokens = max(1, len(completion_text) // 4)
-            total_tokens = prompt_tokens + completion_tokens
-
-            usage = Usage(
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
-                total_tokens=total_tokens,
-            )
-
-            response = ChatCompletionResponse(
-                id=response_id,
-                object="chat.completion",
-                created=created_time,
-                model=request.model,
-                system_fingerprint=f"fp_{hash(request.model) % 1000000:06d}",
-                choices=[
-                    ChatCompletionChoice(
-                        index=0,
-                        message=message,
-                        logprobs=None,
-                        finish_reason=finish_reason,
-                    )
+            # Send finish chunk
+            finish_tool_chunk = {
+                "id": response_id,
+                "object": "chat.completion.chunk",
+                "created": created_time,
+                "model": request.model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {},
+                        "finish_reason": finish_reason,
+                    }
                 ],
-                usage=usage,
-            )
+            }
+            yield f"data: {json.dumps(finish_tool_chunk)}\n\n"
 
-            return response
+            yield "data: [DONE]\n\n"
 
         except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
+            error_chunk = {"error": {"message": str(e), "type": "internal_error"}}
+            yield f"data: {json.dumps(error_chunk)}\n\n"
+
+    return StreamingResponse(
+        stream_response(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Headers": "*",
+            "Access-Control-Allow-Methods": "*",
+        },
+    )
+
+
+def handle_non_streaming_req(
+    messages: List, thread_config: Dict[str, Any], request: ChatCompletionRequest
+):
+    """
+    处理非流式请求
+
+    Args:
+        messages: 消息列表
+        thread_config: langchain state 配置
+        request: 请求对象
+    """
+
+    try:
+        result = agent.invoke({"messages": messages}, config=thread_config)
+
+        # Extract the final message
+        final_message = result["messages"][-1]
+
+        # Generate response ID and timestamp
+        response_id = f"chatcmpl-{int(time.time())}"
+        created_time = int(time.time())
+
+        # Determine finish reason and prepare message
+        finish_reason = "stop"
+        message_content = final_message.content
+        tool_calls = None
+
+        # Check if the message has tool calls
+        if hasattr(final_message, "tool_calls") and final_message.tool_calls:
+            finish_reason = "tool_calls"
+
+            # Convert tool calls to OpenAI format
+            tool_calls = []
+            for tool_call in final_message.tool_calls:
+                openai_tool_call = ToolCall(
+                    id=tool_call.get(
+                        "id", f"call_{int(time.time())}_{len(tool_calls)}"
+                    ),
+                    type="function",
+                    function={
+                        "name": tool_call.get("name", ""),
+                        "arguments": json.dumps(tool_call.get("args", {})),
+                    },
+                )
+                tool_calls.append(openai_tool_call)
+
+        # Create the message object
+        message = ChatMessage(
+            role="assistant", content=message_content, tool_calls=tool_calls
+        )
+
+        # Calculate token usage (simplified estimation)
+        # In a real implementation, you'd want to use tiktoken or similar
+        prompt_text = " ".join([msg.content or "" for msg in request.messages])
+        completion_text = message_content or ""
+
+        # Rough token estimation (1 token ≈ 4 characters)
+        prompt_tokens = max(1, len(prompt_text) // 4)
+        completion_tokens = max(1, len(completion_text) // 4)
+        total_tokens = prompt_tokens + completion_tokens
+
+        usage = Usage(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
+        )
+
+        response = ChatCompletionResponse(
+            id=response_id,
+            object="chat.completion",
+            created=created_time,
+            model=request.model,
+            system_fingerprint=f"fp_{hash(request.model) % 1000000:06d}",
+            choices=[
+                ChatCompletionChoice(
+                    index=0,
+                    message=message,
+                    logprobs=None,
+                    finish_reason=finish_reason,
+                )
+            ],
+            usage=usage,
+        )
+
+        return response
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/health")
