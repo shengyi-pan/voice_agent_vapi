@@ -37,9 +37,20 @@ def create_voice_agent(system_prompt: str = DEF_SYS_PROMPT):
 
     tools = [transferCall]
     agent = create_react_agent(llm, tools, prompt=system_prompt, interrupt_before=["tools"])
+    # agent = create_react_agent(llm, tools, prompt=system_prompt)
     return agent
 
 
 def get_transfer_phone_number():
     """Get the configured transfer phone number"""
     return os.getenv("TRANSFER_PHONE_NUMBER", "+1234567890")
+
+
+def is_transfer_tool(tool_name: str) -> bool:
+    """
+    判断是否是转人工工具
+
+    Args:
+        tool_name: 工具名称
+    """
+    return tool_name == "transferCall"

@@ -12,7 +12,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from langchain_core.messages import HumanMessage, AIMessage, AIMessageChunk
 
-from ..agent.agent import create_voice_agent
+from ..agent.agent import create_voice_agent, is_transfer_tool
 
 
 # Load environment variables
@@ -172,49 +172,46 @@ async def chat_completions(
                 accumulated_chunk = None
                 has_tool_calls = False
                 tool_calls_sent = False
+                ai_content_sent = False
 
                 for event in agent.stream(
                     {"messages": messages}, config=thread_config, stream_mode="messages"
                 ):
                     chunk = event[0]
+                    # 如果 Agent 自动调用工具， AIMessage会交替出现 tool调用 和 内容生成
                     if isinstance(chunk, AIMessageChunk):
-                        # Check if this chunk has tool call chunks
-                        if chunk.tool_call_chunks:
+                        # 如果 content 有数据，就先返回
+                        if chunk.content:
+                            chunk_data = {
+                                "id": response_id,
+                                "object": "chat.completion.chunk",
+                                "created": created_time,
+                                "model": request.model,
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "delta": {"content": chunk.content},
+                                        "finish_reason": None,
+                                    }
+                                ],
+                            }
+                            yield f"data: {json.dumps(chunk_data)}\n\n"
+                            ai_content_sent = True
+
+                        # 如果有工具调用就触发chunk累积，可能会累积到最后的AIMessage
+                        if chunk.tool_call_chunks or has_tool_calls:
                             has_tool_calls = True
                             # Accumulate chunks when tool calls are present
                             if accumulated_chunk is None:
                                 accumulated_chunk = chunk
                             else:
                                 accumulated_chunk += chunk
-                        else:
-                            if has_tool_calls and not tool_calls_sent:
-                                # Still accumulating for tool calls
-                                if accumulated_chunk is None:
-                                    accumulated_chunk = chunk
-                                else:
-                                    accumulated_chunk += chunk
-                            else:
-                                # Normal streaming for non-tool responses
-                                if chunk.content:
-                                    chunk_data = {
-                                        "id": response_id,
-                                        "object": "chat.completion.chunk",
-                                        "created": created_time,
-                                        "model": request.model,
-                                        "choices": [
-                                            {
-                                                "index": 0,
-                                                "delta": {"content": chunk.content},
-                                                "finish_reason": None,
-                                            }
-                                        ],
-                                    }
-                                    yield f"data: {json.dumps(chunk_data)}\n\n"
 
+                is_contain_transfer = False
                 # Handle accumulated tool calls
                 if has_tool_calls and accumulated_chunk and not tool_calls_sent:
-                    # First, send accumulated content if any (content comes before tool calls)
-                    if accumulated_chunk.content:
+                    # 如果累积的 AIMessage 有内容，且没有发送过 AI 内容，就先发送
+                    if accumulated_chunk.content and not ai_content_sent:
                         chunk_data = {
                             "id": response_id,
                             "object": "chat.completion.chunk",
@@ -248,6 +245,10 @@ async def chat_completions(
                                     "arguments": json.dumps(tool_chunk.get("args", {})),
                                 },
                             }
+
+                            if is_transfer_tool(tool_chunk.get("name", "")):
+                                is_contain_transfer = True
+
                             tool_calls_data.append(tool_call)
 
                         # Send tool calls chunk
@@ -265,34 +266,30 @@ async def chat_completions(
                             ],
                         }
                         yield f"data: {json.dumps(tool_chunk_data)}\n\n"
-
-                        # Send finish chunk for tool calls
-                        finish_tool_chunk = {
-                            "id": response_id,
-                            "object": "chat.completion.chunk",
-                            "created": created_time,
-                            "model": request.model,
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "delta": {},
-                                    "finish_reason": "tool_calls",
-                                }
-                            ],
-                        }
-                        yield f"data: {json.dumps(finish_tool_chunk)}\n\n"
                         tool_calls_sent = True
 
-                # Send final chunk only if not already sent for tool calls
-                if not (has_tool_calls and tool_calls_sent):
-                    final_chunk = {
-                        "id": response_id,
-                        "object": "chat.completion.chunk",
-                        "created": created_time,
-                        "model": request.model,
-                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-                    }
-                    yield f"data: {json.dumps(final_chunk)}\n\n"
+                # Send finish chunk with proper finish reason
+                # 如果工具调用包含转人工，finish_reason 为 tool_calls，否则为 stop
+                if is_contain_transfer:
+                    finish_reason = "tool_calls"
+                else:
+                    finish_reason = "stop"
+
+                # Send finish chunk
+                finish_tool_chunk = {
+                    "id": response_id,
+                    "object": "chat.completion.chunk",
+                    "created": created_time,
+                    "model": request.model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {},
+                            "finish_reason": finish_reason,
+                        }
+                    ],
+                }
+                yield f"data: {json.dumps(finish_tool_chunk)}\n\n"
 
                 yield "data: [DONE]\n\n"
 
