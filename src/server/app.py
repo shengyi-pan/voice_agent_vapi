@@ -5,9 +5,10 @@ FastAPI server implementation for Voice Agent VAPI
 import os
 import json
 import time
+from pprint import pprint
 from typing import Dict, Any, List, Optional
 from dotenv import load_dotenv, find_dotenv
-from fastapi import FastAPI, HTTPException, Depends, Header
+from fastapi import FastAPI, HTTPException, Depends, Header, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from langchain_core.messages import HumanMessage, AIMessage, AIMessageChunk
@@ -52,6 +53,8 @@ class ResponseFormat(BaseModel):
 
 class ChatCompletionRequest(BaseModel):
     # Required parameters
+    call: Dict[str, Any]
+
     model: str
     messages: List[ChatMessage]
 
@@ -129,9 +132,20 @@ def verify_token(authorization: str = Header(None)):
 
 @app.post("/v1/chat/completions")
 async def chat_completions(
-    request: ChatCompletionRequest, _: str = Depends(verify_token)
+    request: ChatCompletionRequest,
+    http_request: Request,
+    _: str = Depends(verify_token),
 ):
     """OpenAI-compatible chat completions endpoint"""
+
+    # Output header information
+    print(">>> Request Headers:")
+    for header_name, header_value in http_request.headers.items():
+        print(f"{header_name}: {header_value}")
+    print()
+
+    print(">>> Get request:\n")
+    pprint(request.model_dump(), width=120)
 
     # Convert messages to LangGraph format
     messages = []
